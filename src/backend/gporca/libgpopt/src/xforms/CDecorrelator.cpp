@@ -23,11 +23,123 @@
 #include "gpopt/operators/CLogicalSelect.h"
 #include "gpopt/operators/CLogicalSequenceProject.h"
 #include "gpopt/operators/CPredicateUtils.h"
+#include "gpopt/operators/CScalarBooleanTest.h"
 #include "gpopt/operators/CScalarIdent.h"
 #include "naucrates/md/IMDScalarOp.h"
+#include "naucrates/traceflags/traceflags.h"
 
 
 using namespace gpopt;
+
+// Check if predicate is "(x IS DISTINCT FROM y) = true" (or commuted).
+static BOOL
+FIDFEqualTrue(CExpression *pexprScalar)
+{
+	if (COperator::EopScalarCmp != pexprScalar->Pop()->Eopid() ||
+		!CPredicateUtils::IsEqualityOp(pexprScalar))
+	{
+		return false;
+	}
+
+	CExpression *pexprLeft = (*pexprScalar)[0];
+	CExpression *pexprRight = (*pexprScalar)[1];
+
+	return (CPredicateUtils::FIDF(pexprLeft) &&
+			CUtils::FScalarConstTrue(pexprRight)) ||
+		   (CUtils::FScalarConstTrue(pexprLeft) &&
+			CPredicateUtils::FIDF(pexprRight));
+}
+
+// Check if predicate is "(x IS DISTINCT FROM y) <> true" (or commuted).
+static BOOL
+FIDFNotEqualTrue(CExpression *pexprScalar)
+{
+	if (COperator::EopScalarCmp != pexprScalar->Pop()->Eopid() ||
+		!CPredicateUtils::FComparison(pexprScalar, IMDType::EcmptNEq))
+	{
+		return false;
+	}
+
+	CExpression *pexprLeft = (*pexprScalar)[0];
+	CExpression *pexprRight = (*pexprScalar)[1];
+
+	return (CPredicateUtils::FIDF(pexprLeft) &&
+			CUtils::FScalarConstTrue(pexprRight)) ||
+		   (CUtils::FScalarConstTrue(pexprLeft) &&
+			CPredicateUtils::FIDF(pexprRight));
+}
+
+// Check if predicate is equivalent to "x IS NOT DISTINCT FROM y".
+static BOOL
+FNullSafeEqualityLike(CExpression *pexprScalar)
+{
+	GPOS_ASSERT(NULL != pexprScalar);
+
+	// canonical INDF form represented in ORCA as NOT(IDF)
+	if (CPredicateUtils::FINDF(pexprScalar))
+	{
+		return true;
+	}
+
+	// boolean-test variants:
+	// (x IS DISTINCT FROM y) IS FALSE
+	// (x IS DISTINCT FROM y) IS NOT TRUE
+	if (COperator::EopScalarBooleanTest == pexprScalar->Pop()->Eopid() &&
+		1 == pexprScalar->Arity() && CPredicateUtils::FIDF((*pexprScalar)[0]))
+	{
+		CScalarBooleanTest *popBoolTest =
+			CScalarBooleanTest::PopConvert(pexprScalar->Pop());
+		return CScalarBooleanTest::EbtIsFalse == popBoolTest->Ebt() ||
+			   CScalarBooleanTest::EbtIsNotTrue == popBoolTest->Ebt();
+	}
+
+	// comparison variants:
+	// (x IS DISTINCT FROM y) = false
+	// false = (x IS DISTINCT FROM y)
+	if (COperator::EopScalarCmp == pexprScalar->Pop()->Eopid() &&
+		CPredicateUtils::IsEqualityOp(pexprScalar))
+	{
+		CExpression *pexprLeft = (*pexprScalar)[0];
+		CExpression *pexprRight = (*pexprScalar)[1];
+
+		return (CPredicateUtils::FIDF(pexprLeft) &&
+				CUtils::FScalarConstFalse(pexprRight)) ||
+				   (CUtils::FScalarConstFalse(pexprLeft) &&
+					CPredicateUtils::FIDF(pexprRight));
+	}
+
+	// inequality variant:
+	// (x IS DISTINCT FROM y) <> true
+	// true <> (x IS DISTINCT FROM y)
+	if (FIDFNotEqualTrue(pexprScalar))
+	{
+		return true;
+	}
+
+	// wrapped NOT variants:
+	// NOT ((x IS DISTINCT FROM y) IS TRUE)
+	// NOT ((x IS DISTINCT FROM y) IS NOT FALSE)
+	// NOT ((x IS DISTINCT FROM y) = true)
+	if (CPredicateUtils::FNot(pexprScalar) && 1 == pexprScalar->Arity())
+	{
+		CExpression *pexprChild = (*pexprScalar)[0];
+		if (COperator::EopScalarBooleanTest == pexprChild->Pop()->Eopid() &&
+			1 == pexprChild->Arity() && CPredicateUtils::FIDF((*pexprChild)[0]))
+		{
+			CScalarBooleanTest *popBoolTest =
+				CScalarBooleanTest::PopConvert(pexprChild->Pop());
+			return CScalarBooleanTest::EbtIsTrue == popBoolTest->Ebt() ||
+				   CScalarBooleanTest::EbtIsNotFalse == popBoolTest->Ebt();
+		}
+
+		if (FIDFEqualTrue(pexprChild))
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
 
 
 //---------------------------------------------------------------------------
@@ -134,6 +246,15 @@ CDecorrelator::FDelayable(
 
 	if (fDelay && fEqualityOnly)
 	{
+		/*
+		 * Safe AGGR_FIRST extension:
+		 * treat INDF-equivalent predicates as delayable equality-like
+		 * predicates in decorrelation, gated by the ORCA aggr-first toggle.
+		 */
+		if (GPOS_FTRACE(EopttraceEnableAggrFirstOrcaEnhancement) &&
+			FNullSafeEqualityLike(pexprScalar))
+			return true;
+
 		// check operator
 		fDelay = FDelayableScalarOp(pexprScalar);
 	}

@@ -428,6 +428,7 @@ bool		optimizer_enable_associativity;
 bool		optimizer_enable_eageragg;
 bool		optimizer_enable_range_predicate_dpe;
 bool		optimizer_enable_orderedagg;
+bool		optimizer_enable_aggr_first_orca_enhancement;
 
 /* Analyze related GUCs for Optimizer */
 bool		optimizer_analyze_root_partition;
@@ -759,7 +760,6 @@ struct config_bool ConfigureNamesBool_gp[] =
 		&gp_enable_minmax_optimization,
 		true, NULL, NULL
 	},
-
 	{
 		{"gp_enable_multiphase_agg", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of two- or three-stage parallel aggregation plans."),
@@ -3267,6 +3267,17 @@ struct config_bool ConfigureNamesBool_gp[] =
 		&optimizer_enable_orderedagg,
 		false,
 		NULL, NULL, NULL
+	},
+
+	{
+		{"optimizer_enable_aggr_first_orca_enhancement", PGC_USERSET, DEVELOPER_OPTIONS,
+		 gettext_noop("Enable AGGR_FIRST experimental enhancements in ORCA."),
+		 NULL,
+		 GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE
+		 },
+		 &optimizer_enable_aggr_first_orca_enhancement,
+		 true,
+		 NULL, NULL, NULL
 	},
 
 	{

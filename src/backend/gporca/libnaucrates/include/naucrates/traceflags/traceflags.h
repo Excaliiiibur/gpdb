@@ -231,6 +231,9 @@ enum EOptTraceFlag
 	// Keep locks on partition children during planning
 	EopttraceKeepPartitionChildrenLocks = 103045,
 
+	// Enable AGGR_FIRST experimental enhancements in ORCA
+	EopttraceEnableAggrFirstOrcaEnhancement = 103046,
+
 	///////////////////////////////////////////////////////
 	///////////////////// statistics flags ////////////////
 	//////////////////////////////////////////////////////

@@ -29,6 +29,7 @@
 
 #include "gpopt/base/CColRefSetIter.h"
 #include "gpopt/exception.h"
+#include "gpopt/mdcache/CMDAccessorUtils.h"
 #include "gpopt/operators/CLogicalConstTableGet.h"
 #include "gpopt/operators/CLogicalGbAgg.h"
 #include "gpopt/operators/CLogicalInnerApply.h"
@@ -41,10 +42,14 @@
 #include "gpopt/operators/CLogicalLeftSemiCorrelatedApplyIn.h"
 #include "gpopt/operators/CLogicalMaxOneRow.h"
 #include "gpopt/operators/CScalarBooleanTest.h"
+#include "gpopt/operators/CScalarAggFunc.h"
+#include "gpopt/operators/CScalarBoolOp.h"
 #include "gpopt/operators/CScalarCmp.h"
 #include "gpopt/operators/CScalarCoalesce.h"
+#include "gpopt/operators/CScalarFunc.h"
 #include "gpopt/operators/CScalarIdent.h"
 #include "gpopt/operators/CScalarIf.h"
+#include "gpopt/operators/CScalarOp.h"
 #include "gpopt/operators/CScalarProjectElement.h"
 #include "gpopt/operators/CScalarProjectList.h"
 #include "gpopt/operators/CScalarSubquery.h"
@@ -55,8 +60,204 @@
 #include "naucrates/md/IMDScalarOp.h"
 #include "naucrates/md/IMDTypeBool.h"
 #include "naucrates/md/IMDTypeInt8.h"
+#include "naucrates/traceflags/traceflags.h"
 
 using namespace gpopt;
+
+// OB-aligned (is_null_propagate_expr style) null-propagation checker:
+// - target identifiers propagate NULL
+// - for strict operators/functions, if any child propagates NULL then current
+//   expression propagates NULL
+// - constants do not propagate NULL
+static BOOL
+FNullPropagateScalarExpr(const CExpression *pexpr)
+{
+	GPOS_ASSERT(NULL != pexpr);
+
+	switch (pexpr->Pop()->Eopid())
+	{
+		case COperator::EopScalarSubquery:
+		case COperator::EopScalarIdent:
+			return true;
+
+		case COperator::EopScalarConst:
+			return false;
+
+		case COperator::EopScalarCast:
+		case COperator::EopScalarCoerceToDomain:
+		case COperator::EopScalarCoerceViaIO:
+		case COperator::EopScalarArrayCoerceExpr:
+			return 1 == pexpr->Arity() && FNullPropagateScalarExpr((*pexpr)[0]);
+
+		case COperator::EopScalarOp:
+		{
+			CScalarOp *popScalarOp =
+				CScalarOp::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+			if (!CMDAccessorUtils::FScalarOpReturnsNullOnNullInput(
+					md_accessor, popScalarOp->MdIdOp()))
+			{
+				return false;
+			}
+
+			for (ULONG ul = 0; ul < pexpr->Arity(); ul++)
+			{
+				if (FNullPropagateScalarExpr((*pexpr)[ul]))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		case COperator::EopScalarFunc:
+		{
+			CScalarFunc *popScalarFunc =
+				CScalarFunc::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+			const IMDFunction *md_func =
+				md_accessor->RetrieveFunc(popScalarFunc->FuncMdId());
+			if (!md_func->IsStrict())
+			{
+				return false;
+			}
+
+			for (ULONG ul = 0; ul < pexpr->Arity(); ul++)
+			{
+				if (FNullPropagateScalarExpr((*pexpr)[ul]))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		default:
+			return false;
+	}
+}
+
+// Check whether the operator itself is strict in the SQL sense:
+// if any direct input is NULL, output is NULL.
+static BOOL
+FReturnsNullOnNullInputNode(const CExpression *pexpr)
+{
+	GPOS_ASSERT(NULL != pexpr);
+
+	CMDAccessor *md_accessor = COptCtxt::PoctxtFromTLS()->Pmda();
+	switch (pexpr->Pop()->Eopid())
+	{
+		case COperator::EopScalarCmp:
+		{
+			CScalarCmp *popCmp =
+				CScalarCmp::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			return CMDAccessorUtils::FScalarOpReturnsNullOnNullInput(
+				md_accessor, popCmp->MdIdOp());
+		}
+		case COperator::EopScalarOp:
+		{
+			CScalarOp *popOp =
+				CScalarOp::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			return CMDAccessorUtils::FScalarOpReturnsNullOnNullInput(
+				md_accessor, popOp->MdIdOp());
+		}
+		case COperator::EopScalarFunc:
+		{
+			CScalarFunc *popFunc =
+				CScalarFunc::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			const IMDFunction *md_func =
+				md_accessor->RetrieveFunc(popFunc->FuncMdId());
+			return md_func->IsStrict();
+		}
+		case COperator::EopScalarCast:
+		case COperator::EopScalarCoerceToDomain:
+		case COperator::EopScalarCoerceViaIO:
+		case COperator::EopScalarArrayCoerceExpr:
+			return true;
+		default:
+			return false;
+	}
+}
+
+// OB-style conservative null-reject detector for conditions containing
+// subqueries. This is used to propagate null-reject through composite boolean
+// wrappers (AND/OR/NOT) without over-enabling unsafe cases.
+static BOOL
+FIsNullRejectConditionForSubquery(const CExpression *pexpr)
+{
+	GPOS_ASSERT(NULL != pexpr);
+
+	// target-specific guard: a condition not referencing subquery result
+	// cannot establish null-rejectness for subquery-driven rewriting.
+	if (!const_cast<CExpression *>(pexpr)->DeriveHasSubquery())
+	{
+		return false;
+	}
+
+	switch (pexpr->Pop()->Eopid())
+	{
+		case COperator::EopScalarBoolOp:
+		{
+			CScalarBoolOp *popBool =
+				CScalarBoolOp::PopConvert(const_cast<COperator *>(pexpr->Pop()));
+			if (CScalarBoolOp::EboolopAnd == popBool->Eboolop())
+			{
+				for (ULONG ul = 0; ul < pexpr->Arity(); ul++)
+				{
+					if (FIsNullRejectConditionForSubquery((*pexpr)[ul]))
+					{
+						return true;
+					}
+				}
+				return false;
+			}
+			if (CScalarBoolOp::EboolopOr == popBool->Eboolop())
+			{
+				for (ULONG ul = 0; ul < pexpr->Arity(); ul++)
+				{
+					if (!FIsNullRejectConditionForSubquery((*pexpr)[ul]))
+					{
+						return false;
+					}
+				}
+				return true;
+			}
+			if (CScalarBoolOp::EboolopNot == popBool->Eboolop() &&
+				1 == pexpr->Arity())
+			{
+				return FNullPropagateScalarExpr((*pexpr)[0]) &&
+					   (*pexpr)[0]->DeriveHasSubquery();
+			}
+			return false;
+		}
+		case COperator::EopScalarBooleanTest:
+		{
+			CScalarBooleanTest *popBoolTest = CScalarBooleanTest::PopConvert(
+				const_cast<COperator *>(pexpr->Pop()));
+			if (0 == pexpr->Arity())
+			{
+				return false;
+			}
+
+			CExpression *pexprChild = (*pexpr)[0];
+			if (CScalarBooleanTest::EbtIsTrue == popBoolTest->Ebt())
+			{
+				return FIsNullRejectConditionForSubquery(pexprChild);
+			}
+			if (CScalarBooleanTest::EbtIsFalse == popBoolTest->Ebt() ||
+				CScalarBooleanTest::EbtIsNotUnknown == popBoolTest->Ebt())
+			{
+				return FNullPropagateScalarExpr(pexprChild) &&
+					   pexprChild->DeriveHasSubquery();
+			}
+			return false;
+		}
+		case COperator::EopScalarNullTest:
+			return false;
+		default:
+			return FNullPropagateScalarExpr(pexpr);
+	}
+}
 
 #ifdef GPOS_DEBUG
 //---------------------------------------------------------------------------
@@ -207,7 +408,8 @@ CSubqueryHandler::PexprSubqueryPred(CExpression *pexprOuter,
 		esqctxt = EsqctxtValue;
 	}
 
-	if (!FProcess(pexprOuter, pexprScalarChild, esqctxt, &pexprNewLogical,
+	if (!FProcess(pexprOuter, pexprScalarChild, esqctxt,
+				  false /*fNullRejectContext*/, &pexprNewLogical,
 				  &pexprNewScalar))
 	{
 		// subquery unnesting failed; attempt to create a predicate directly
@@ -323,7 +525,209 @@ CSubqueryHandler::SSubqueryDesc::SetCorrelatedExecution()
 		m_returns_set ||  // subquery produces > 1 rows, we need correlated execution to check for cardinality at runtime
 		m_fHasVolatileFunctions ||	// volatile functions cannot be decorrelated
 		(m_fHasCountAgg &&
-		 m_fHasSkipLevelCorrelations);	// count() with skip-level correlations cannot be decorrelated due to their NULL semantics
+		 m_fHasSkipLevelCorrelations) ||	// count() with skip-level correlations cannot be decorrelated due to their NULL semantics
+		(GPOS_FTRACE(EopttraceEnableAggrFirstOrcaEnhancement) &&
+		 m_aggr_first_analysis.m_fHasUnsafeAggArg);	 // OB-like safety fallback for non null-propagate aggregate args
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CSubqueryHandler::FIsNamedAgg
+//
+//	@doc:
+//		Check if aggregate name matches the supplied built-in aggregate name.
+//		We strip optional schema qualification (e.g. "pg_catalog.count").
+//
+//---------------------------------------------------------------------------
+BOOL
+CSubqueryHandler::FIsNamedAgg(const CScalarAggFunc *agg_func,
+							  const WCHAR *agg_name)
+{
+	GPOS_ASSERT(NULL != agg_func);
+	GPOS_ASSERT(NULL != agg_name);
+
+	const CWStringConst *agg_func_name = agg_func->PstrAggFunc();
+	if (NULL == agg_func_name || NULL == agg_func_name->GetBuffer())
+	{
+		return false;
+	}
+
+	const WCHAR *full_name = agg_func_name->GetBuffer();
+	const WCHAR *last_dot = wcsrchr(full_name, L'.');
+	const WCHAR *name_to_compare = (NULL == last_dot) ? full_name : (last_dot + 1);
+
+	return (0 == wcscmp(name_to_compare, agg_name));
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CSubqueryHandler::FIsSupportedAggrFirstAgg
+//
+//	@doc:
+//		AGGR_FIRST candidate analysis currently whitelists SUM/COUNT/MIN/MAX/AVG.
+//		Note: this whitelist feeds analysis metadata (e.g. m_fHasUnsupportedAgg),
+//		but does not by itself gate every decorrelation/enhancement path.
+//		Some AVG cases can still benefit from other enhancement branches
+//		(e.g. null-reject propagation + decorrelator delayability).
+//
+//---------------------------------------------------------------------------
+BOOL
+CSubqueryHandler::FIsSupportedAggrFirstAgg(const CScalarAggFunc *agg_func)
+{
+	GPOS_ASSERT(NULL != agg_func);
+
+	return FIsNamedAgg(agg_func, L"count") || FIsNamedAgg(agg_func, L"sum") ||
+		   FIsNamedAgg(agg_func, L"min") || FIsNamedAgg(agg_func, L"max") ||
+		   FIsNamedAgg(agg_func, L"avg");
+}
+
+BOOL
+CSubqueryHandler::FNullPropagateAggArg(const CExpression *pexprAggExpr)
+{
+	GPOS_ASSERT(NULL != pexprAggExpr);
+	GPOS_ASSERT(COperator::EopScalarAggFunc == pexprAggExpr->Pop()->Eopid());
+
+	const ULONG arity = pexprAggExpr->Arity();
+	if (0 == arity)
+	{
+		// count(*) style
+		return true;
+	}
+
+	// ORCA represents aggregate arguments via a ScalarValuesList in child(0),
+	// and keeps extra argument slots in additional ScalarValuesList children.
+	const CExpression *pexprArgList = (*pexprAggExpr)[0];
+	if (COperator::EopScalarValuesList != pexprArgList->Pop()->Eopid())
+	{
+		return false;
+	}
+
+	if (0 == pexprArgList->Arity())
+	{
+		// count(*) style carried via empty arg list
+		return true;
+	}
+
+	if (1 != pexprArgList->Arity())
+	{
+		return false;
+	}
+
+	const CExpression *pexprArg = (*pexprArgList)[0];
+	return FNullPropagateScalarExpr(pexprArg);
+}
+
+
+//---------------------------------------------------------------------------
+//	@function:
+//		CSubqueryHandler::AnalyzeAggrFirstCandidate
+//
+//	@doc:
+//		Collect OB-like AGGR_FIRST preconditions and null-semantics markers.
+//		This function does not change plan shape yet; it only records readiness.
+//
+//---------------------------------------------------------------------------
+void
+CSubqueryHandler::AnalyzeAggrFirstCandidate(CExpression *pexprSubquery,
+											SSubqueryDesc *psd,
+											BOOL fNullRejectContext)
+{
+	GPOS_ASSERT(NULL != pexprSubquery);
+	GPOS_ASSERT(NULL != psd);
+
+	if (!GPOS_FTRACE(EopttraceEnableAggrFirstOrcaEnhancement))
+	{
+		return;
+	}
+
+	CExpression *pexprInner = (*pexprSubquery)[0];
+	CExpression *pexprGbAgg = NULL;
+
+	if (COperator::EopLogicalGbAgg == pexprInner->Pop()->Eopid())
+	{
+		pexprGbAgg = pexprInner;
+	}
+	else if (COperator::EopLogicalProject == pexprInner->Pop()->Eopid() &&
+			 COperator::EopLogicalGbAgg == (*pexprInner)[0]->Pop()->Eopid())
+	{
+		pexprGbAgg = (*pexprInner)[0];
+	}
+
+	if (NULL == pexprGbAgg)
+	{
+		return;
+	}
+
+	CLogicalGbAgg *popGbAgg = CLogicalGbAgg::PopConvert(pexprGbAgg->Pop());
+	psd->m_aggr_first_analysis.m_fHasScalarGbAgg =
+		(0 == popGbAgg->Pdrgpcr()->Size());
+	psd->m_aggr_first_analysis.m_fHasCorrelatedCols =
+		(*pexprSubquery)[0]->HasOuterRefs();
+	psd->m_aggr_first_analysis.m_fParentNullRejectContext =
+		fNullRejectContext;
+
+	CExpression *pexprAggPrjList = (*pexprGbAgg)[1];
+	const ULONG arity = pexprAggPrjList->Arity();
+	for (ULONG ul = 0; ul < arity; ul++)
+	{
+		CExpression *pexprPrjElem = (*pexprAggPrjList)[ul];
+		if (COperator::EopScalarProjectElement != pexprPrjElem->Pop()->Eopid())
+		{
+			psd->m_aggr_first_analysis.m_fHasUnsupportedAgg = true;
+			break;
+		}
+
+		CExpression *pexprAggExpr = (*pexprPrjElem)[0];
+		if (COperator::EopScalarAggFunc != pexprAggExpr->Pop()->Eopid())
+		{
+			psd->m_aggr_first_analysis.m_fHasUnsupportedAgg = true;
+			break;
+		}
+
+		CScalarAggFunc *agg_func = CScalarAggFunc::PopConvert(pexprAggExpr->Pop());
+		if (!agg_func->FGlobal() || agg_func->IsDistinct() ||
+			!FIsSupportedAggrFirstAgg(agg_func))
+		{
+			psd->m_aggr_first_analysis.m_fHasUnsupportedAgg = true;
+			break;
+		}
+
+		const BOOL is_count_like = agg_func->FCountStar() || agg_func->FCountAny() ||
+								   FIsNamedAgg(agg_func, L"count");
+		psd->m_aggr_first_analysis.m_fHasCountLikeAgg =
+			psd->m_aggr_first_analysis.m_fHasCountLikeAgg || is_count_like;
+		psd->m_aggr_first_analysis.m_fHasNonCountAgg =
+			psd->m_aggr_first_analysis.m_fHasNonCountAgg || !is_count_like;
+		// Keep COUNT-like semantics on existing path; enforce null-propagate
+		// safety only for non-COUNT aggregates in this phase.
+		if (!is_count_like)
+		{
+			psd->m_aggr_first_analysis.m_fHasUnsafeAggArg =
+				psd->m_aggr_first_analysis.m_fHasUnsafeAggArg ||
+				!FNullPropagateAggArg(pexprAggExpr);
+		}
+	}
+
+	// OB-aligned relaxation: if scalar subquery result is consumed by a
+	// null-rejecting comparison, we can avoid forcing correlated execution for
+	// non-count aggregates even when aggregate argument is not null-propagate.
+	if (psd->m_aggr_first_analysis.m_fParentNullRejectContext &&
+		!psd->m_aggr_first_analysis.m_fHasCountLikeAgg)
+	{
+		psd->m_aggr_first_analysis.m_fHasUnsafeAggArg = false;
+	}
+
+	psd->m_aggr_first_analysis.m_fRequiresNotNullProbe =
+		psd->m_aggr_first_analysis.m_fHasCountLikeAgg;
+	psd->m_aggr_first_analysis.m_fNeedsOuterJoinSemantics =
+		psd->m_aggr_first_analysis.m_fHasCountLikeAgg;
+	psd->m_aggr_first_analysis.m_fCandidate =
+		psd->m_aggr_first_analysis.m_fHasScalarGbAgg &&
+		psd->m_aggr_first_analysis.m_fHasCorrelatedCols &&
+		!psd->m_aggr_first_analysis.m_fHasUnsupportedAgg &&
+		!psd->m_aggr_first_analysis.m_fHasUnsafeAggArg;
 }
 
 
@@ -338,7 +742,7 @@ CSubqueryHandler::SSubqueryDesc::SetCorrelatedExecution()
 CSubqueryHandler::SSubqueryDesc *
 CSubqueryHandler::Psd(CMemoryPool *mp, CExpression *pexprSubquery,
 					  CExpression *pexprOuter, const CColRef *pcrSubquery,
-					  ESubqueryCtxt esqctxt)
+					  ESubqueryCtxt esqctxt, BOOL fNullRejectContext)
 {
 	GPOS_ASSERT(NULL != pexprSubquery);
 	GPOS_ASSERT(CUtils::FSubquery(pexprSubquery->Pop()));
@@ -378,6 +782,11 @@ CSubqueryHandler::Psd(CMemoryPool *mp, CExpression *pexprSubquery,
 	psd->m_fValueSubquery = EsqctxtValue == esqctxt ||
 							(psd->m_fHasCountAgg && psd->m_fHasOuterRefs);
 
+	// collect AGGR_FIRST eligibility/semantics markers (used by follow-up phases)
+	// These markers are intentionally conservative and are not the sole gate for
+	// all enhancement paths.
+	AnalyzeAggrFirstCandidate(pexprSubquery, psd, fNullRejectContext);
+
 	// set flag of correlated execution
 	psd->SetCorrelatedExecution();
 
@@ -402,6 +811,7 @@ BOOL
 CSubqueryHandler::FRemoveScalarSubquery(CExpression *pexprOuter,
 										CExpression *pexprSubquery,
 										ESubqueryCtxt esqctxt,
+										BOOL fNullRejectContext,
 										CExpression **ppexprNewOuter,
 										CExpression **ppexprResidualScalar)
 {
@@ -417,7 +827,8 @@ CSubqueryHandler::FRemoveScalarSubquery(CExpression *pexprOuter,
 	const CColRef *pcrSubquery = popScalarSubquery->Pcr();
 
 	SSubqueryDesc *psd =
-		Psd(pmp, pexprSubquery, pexprOuter, pcrSubquery, esqctxt);
+		Psd(pmp, pexprSubquery, pexprOuter, pcrSubquery, esqctxt,
+			fNullRejectContext);
 
 	if (psd->m_fReturnedPcrIsOuterRef)
 	{
@@ -459,7 +870,8 @@ CSubqueryHandler::FRemoveScalarSubquery(CExpression *pexprOuter,
 		GPOS_DELETE(psd);
 		CExpression *pexprNewOuter = NULL;
 		CExpression *pexprResidualScalar = NULL;
-		psd = Psd(m_mp, pexprNewSubq, pexprOuter, popInnerSubq->Pcr(), esqctxt);
+		psd = Psd(m_mp, pexprNewSubq, pexprOuter, popInnerSubq->Pcr(),
+				  esqctxt, fNullRejectContext);
 		fSuccess = FRemoveScalarSubqueryInternal(
 			m_mp, pexprOuter, pexprNewSubq, EsqctxtValue, psd,
 			m_fEnforceCorrelatedApply, &pexprNewOuter, &pexprResidualScalar);
@@ -2010,6 +2422,7 @@ BOOL
 CSubqueryHandler::FRecursiveHandler(CExpression *pexprOuter,
 									CExpression *pexprScalar,
 									ESubqueryCtxt esqctxt,
+									BOOL fNullRejectContext,
 									CExpression **ppexprNewOuter,
 									CExpression **ppexprResidualScalar)
 {
@@ -2044,6 +2457,51 @@ CSubqueryHandler::FRecursiveHandler(CExpression *pexprOuter,
 		CExpression *pexprNewLogical = NULL;
 		CExpression *pexprNewScalar = NULL;
 
+		// Special case for SQL "IS NOT NULL", represented as NOT(NullTest(arg)).
+		// In a null-reject parent context, NULL subquery result is rejected here,
+		// so we can propagate null-reject directly to the NullTest argument.
+		if (fNullRejectContext && COperator::EopScalarBoolOp == popScalar->Eopid())
+		{
+			CScalarBoolOp *popBool =
+				CScalarBoolOp::PopConvert(const_cast<COperator *>(popScalar));
+			if (CScalarBoolOp::EboolopNot == popBool->Eboolop() &&
+				COperator::EopScalarNullTest == popScalarChild->Eopid() &&
+				1 == pexprScalarChild->Arity())
+			{
+				CExpression *pexprNullTestArg = (*pexprScalarChild)[0];
+				// Align with OB: "IS NOT NULL" is null-reject only when its
+				// argument is null-propagate.
+				if (FNullPropagateScalarExpr(pexprNullTestArg))
+				{
+					CExpression *pexprNewNullTestArg = NULL;
+					if (!FProcess(pexprCurrentOuter, pexprNullTestArg, esqctxt,
+								  true /* fNullRejectContext */,
+								  &pexprNewLogical, &pexprNewNullTestArg))
+					{
+						*ppexprNewOuter = pexprCurrentOuter;
+						pdrgpexpr->Release();
+						return false;
+					}
+
+					if (pexprNullTestArg->DeriveHasSubquery())
+					{
+						GPOS_ASSERT(NULL != pexprNewLogical);
+						pexprCurrentOuter = pexprNewLogical;
+					}
+
+					COperator *popNullTest = pexprScalarChild->Pop();
+					popNullTest->AddRef();
+					CExpressionArray *pdrgpexprNullTest =
+						GPOS_NEW(mp) CExpressionArray(mp);
+					pdrgpexprNullTest->Append(pexprNewNullTestArg);
+					pexprNewScalar = GPOS_NEW(mp)
+						CExpression(mp, popNullTest, pdrgpexprNullTest);
+					pdrgpexpr->Append(pexprNewScalar);
+					continue;
+				}
+			}
+		}
+
 		// Set the subquery context to Value for a non-scalar subquery nested in a
 		// scalar expression such that the corresponding subquery unnesting routines
 		// will return a column identifier. The identifier is then used to replace the
@@ -2072,7 +2530,71 @@ CSubqueryHandler::FRecursiveHandler(CExpression *pexprOuter,
 			esqctxt = EsqctxtValue;
 		}
 
+		BOOL childNullRejectContext = false;
+
+		// OB-like null-reject propagation:
+		// 1) direct comparison operands are null-reject contexts
+		// 2) inside a null-reject context, strict wrappers preserve null-reject
+		//    for their children
+		// 3) inside a null-reject context, AND/NOT and selected BooleanTest
+		//    forms preserve null-reject for their child(ren).
+		if (COperator::EopScalarCmp == popScalar->Eopid() &&
+			FReturnsNullOnNullInputNode(pexprScalar))
+		{
+			childNullRejectContext = true;
+		}
+		else if (fNullRejectContext && FReturnsNullOnNullInputNode(pexprScalar))
+		{
+			childNullRejectContext = true;
+		}
+		else if (fNullRejectContext &&
+				 COperator::EopScalarBoolOp == popScalar->Eopid())
+		{
+			CScalarBoolOp *popBool =
+				CScalarBoolOp::PopConvert(const_cast<COperator *>(popScalar));
+			if (CScalarBoolOp::EboolopAnd == popBool->Eboolop())
+			{
+				childNullRejectContext = true;
+			}
+			else if (CScalarBoolOp::EboolopNot == popBool->Eboolop() &&
+					 FNullPropagateScalarExpr(pexprScalarChild))
+			{
+				childNullRejectContext = true;
+			}
+			else if (CScalarBoolOp::EboolopOr == popBool->Eboolop())
+			{
+				BOOL fAllOtherChildrenNullReject = true;
+				for (ULONG ulOther = 0;
+					 fAllOtherChildrenNullReject && ulOther < arity; ulOther++)
+				{
+					if (ulOther == ul)
+					{
+						continue;
+					}
+					fAllOtherChildrenNullReject =
+						FIsNullRejectConditionForSubquery((*pexprScalar)[ulOther]);
+				}
+				if (fAllOtherChildrenNullReject)
+				{
+					childNullRejectContext = true;
+				}
+			}
+		}
+		else if (fNullRejectContext &&
+				 COperator::EopScalarBooleanTest == popScalar->Eopid())
+		{
+			CScalarBooleanTest *popBoolTest = CScalarBooleanTest::PopConvert(
+				const_cast<COperator *>(popScalar));
+			if (CScalarBooleanTest::EbtIsTrue == popBoolTest->Ebt() ||
+				CScalarBooleanTest::EbtIsFalse == popBoolTest->Ebt() ||
+				CScalarBooleanTest::EbtIsNotUnknown == popBoolTest->Ebt())
+			{
+				childNullRejectContext = true;
+			}
+		}
+
 		if (!FProcess(pexprCurrentOuter, pexprScalarChild, esqctxt,
+					  childNullRejectContext,
 					  &pexprNewLogical, &pexprNewScalar))
 		{
 			// subquery unnesting failed, cleanup created expressions
@@ -2116,6 +2638,7 @@ BOOL
 CSubqueryHandler::FProcessScalarOperator(CExpression *pexprOuter,
 										 CExpression *pexprScalar,
 										 ESubqueryCtxt esqctxt,
+										 BOOL fNullRejectContext,
 										 CExpression **ppexprNewOuter,
 										 CExpression **ppexprResidualScalar)
 {
@@ -2133,6 +2656,7 @@ CSubqueryHandler::FProcessScalarOperator(CExpression *pexprOuter,
 		case COperator::EopScalarSubquery:
 			fSuccess =
 				FRemoveScalarSubquery(pexprOuter, pexprScalar, esqctxt,
+									  fNullRejectContext,
 									  ppexprNewOuter, ppexprResidualScalar);
 			break;
 		case COperator::EopScalarSubqueryAny:
@@ -2181,6 +2705,7 @@ CSubqueryHandler::FProcessScalarOperator(CExpression *pexprOuter,
 		case COperator::EopScalarValuesList:
 		case COperator::EopScalarMinMax:
 			fSuccess = FRecursiveHandler(pexprOuter, pexprScalar, esqctxt,
+										 fNullRejectContext,
 										 ppexprNewOuter, ppexprResidualScalar);
 			break;
 		default:
@@ -2223,6 +2748,7 @@ CSubqueryHandler::FProcess(
 	CExpression *pexprOuter,   // logical child of a SELECT node
 	CExpression *pexprScalar,  // scalar child of a SELECT node
 	ESubqueryCtxt esqctxt,	   // context in which subquery occurs
+	BOOL fNullRejectContext,   // parent context rejects NULL subquery result
 	CExpression *
 		*ppexprNewOuter,  // an Apply logical expression produced as output
 	CExpression *
@@ -2244,6 +2770,7 @@ CSubqueryHandler::FProcess(
 	}
 
 	return FProcessScalarOperator(pexprOuter, pexprScalar, esqctxt,
+								  fNullRejectContext,
 								  ppexprNewOuter, ppexprResidualScalar);
 }
 

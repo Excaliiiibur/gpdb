@@ -19,6 +19,7 @@
 namespace gpopt
 {
 using namespace gpos;
+class CScalarAggFunc;
 
 //---------------------------------------------------------------------------
 //	@class:
@@ -50,6 +51,35 @@ private:
 	//---------------------------------------------------------------------------
 	struct SSubqueryDesc
 	{
+		// AGGR_FIRST readiness analysis for scalar aggregate subqueries
+			struct SAggrFirstAnalysis
+			{
+				BOOL m_fCandidate;
+				BOOL m_fHasScalarGbAgg;
+				BOOL m_fHasCorrelatedCols;
+				BOOL m_fHasUnsupportedAgg;
+				BOOL m_fHasUnsafeAggArg;
+				BOOL m_fNeedsOuterJoinSemantics;
+				BOOL m_fHasCountLikeAgg;
+				BOOL m_fHasNonCountAgg;
+				BOOL m_fRequiresNotNullProbe;
+				BOOL m_fParentNullRejectContext;
+
+			SAggrFirstAnalysis()
+					: m_fCandidate(false),
+					  m_fHasScalarGbAgg(false),
+					  m_fHasCorrelatedCols(false),
+					  m_fHasUnsupportedAgg(false),
+					  m_fHasUnsafeAggArg(false),
+					  m_fNeedsOuterJoinSemantics(false),
+					  m_fHasCountLikeAgg(false),
+					  m_fHasNonCountAgg(false),
+				  m_fRequiresNotNullProbe(false),
+				  m_fParentNullRejectContext(false)
+			{
+			}
+		};
+
 		// subquery can return more than one row
 		BOOL m_returns_set;
 
@@ -79,6 +109,9 @@ private:
 
 		// subquery requires correlated execution
 		BOOL m_fCorrelatedExecution;
+
+		// AGGR_FIRST analyzer output
+		SAggrFirstAnalysis m_aggr_first_analysis;
 
 		// ctor
 		SSubqueryDesc()
@@ -189,12 +222,28 @@ private:
 	static SSubqueryDesc *Psd(CMemoryPool *mp, CExpression *pexprSubquery,
 							  CExpression *pexprOuter,
 							  const CColRef *pcrSubquery,
-							  ESubqueryCtxt esqctxt);
+							  ESubqueryCtxt esqctxt,
+							  BOOL fNullRejectContext);
 
-	// detect subqueries with expressions over count aggregate similar to
-	// (SELECT 'abc' || (SELECT count(*) from X))
-	static BOOL FProjectCountSubquery(CExpression *pexprSubquery,
-									  CColRef *ppcrCount);
+		// detect subqueries with expressions over count aggregate similar to
+		// (SELECT 'abc' || (SELECT count(*) from X))
+		static BOOL FProjectCountSubquery(CExpression *pexprSubquery,
+										  CColRef *ppcrCount);
+
+		// true if aggregate name matches one of the AGGR_FIRST supported builtin names
+		static BOOL FIsNamedAgg(const CScalarAggFunc *agg_func,
+							   const WCHAR *agg_name);
+
+		// true if aggregate function can participate in AGGR_FIRST rewrite
+		static BOOL FIsSupportedAggrFirstAgg(const CScalarAggFunc *agg_func);
+
+		// conservative null-propagation safety check for aggregate argument
+		static BOOL FNullPropagateAggArg(const CExpression *pexprAggExpr);
+
+		// collect AGGR_FIRST eligibility/null-semantics markers for future rewrites
+		static void AnalyzeAggrFirstCandidate(CExpression *pexprSubquery,
+											 SSubqueryDesc *psd,
+											 BOOL fNullRejectContext);
 
 	// given an input expression, replace all occurrences of given column with the given scalar expression
 	static CExpression *PexprReplace(CMemoryPool *mp, CExpression *pexpr,
@@ -205,6 +254,7 @@ private:
 	BOOL FRemoveScalarSubquery(CExpression *pexprOuter,
 							   CExpression *pexprSubquery,
 							   ESubqueryCtxt esqctxt,
+							   BOOL fNullRejectContext,
 							   CExpression **ppexprNewOuter,
 							   CExpression **ppexprResidualScalar);
 
@@ -258,12 +308,14 @@ private:
 
 	// handle subqueries in scalar tree recursively
 	BOOL FRecursiveHandler(CExpression *pexprOuter, CExpression *pexprScalar,
-						   ESubqueryCtxt esqctxt, CExpression **ppexprNewOuter,
+						   ESubqueryCtxt esqctxt, BOOL fNullRejectContext,
+						   CExpression **ppexprNewOuter,
 						   CExpression **ppexprNewScalar);
 
 	// handle subqueries on a case-by-case basis
 	BOOL FProcessScalarOperator(CExpression *pexprOuter,
 								CExpression *pexprScalar, ESubqueryCtxt esqctxt,
+								BOOL fNullRejectContext,
 								CExpression **ppexprNewOuter,
 								CExpression **ppexprNewScalar);
 
@@ -293,6 +345,7 @@ public:
 		CExpression *pexprOuter,   // logical child of a SELECT node
 		CExpression *pexprScalar,  // scalar child of a SELECT node
 		ESubqueryCtxt esqctxt,	   // context in which subquery occurs
+		BOOL fNullRejectContext,   // parent context rejects NULL subquery result
 		CExpression *
 			*ppexprNewOuter,  // an Apply logical expression produced as output
 		CExpression **

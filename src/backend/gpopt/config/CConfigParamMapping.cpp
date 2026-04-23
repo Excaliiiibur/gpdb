@@ -275,6 +275,11 @@ CConfigParamMapping::SConfigMappingElem CConfigParamMapping::m_elements[] = {
 	 false,	 // m_negate_param
 	 GPOS_WSZ_LIT("Enable ordered aggregate plans.")},
 
+	{EopttraceEnableAggrFirstOrcaEnhancement,
+	 &optimizer_enable_aggr_first_orca_enhancement,
+	 false,	 // m_negate_param
+	 GPOS_WSZ_LIT("Enable AGGR_FIRST experimental enhancements in ORCA.")},
+
 	{EopttraceExpandFullJoin, &optimizer_expand_fulljoin,
 	 false,	 // m_negate_param
 	 GPOS_WSZ_LIT(

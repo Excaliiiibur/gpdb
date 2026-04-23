@@ -381,6 +381,7 @@
 		"optimizer_enable_dynamicbitmapscan",
 		"optimizer_enable_eageragg",
 		"optimizer_enable_orderedagg",
+		"optimizer_enable_aggr_first_orca_enhancement",
 		"optimizer_enable_gather_on_segment_for_dml",
 		"optimizer_enable_groupagg",
 		"optimizer_enable_hashagg",
