@@ -179,6 +179,7 @@ test: interrupt_holdoff_count
 test: catalog
 
 test: bfv_catalog bfv_index bfv_olap bfv_aggregate bfv_partition bfv_partition_plans DML_over_joins gporca bfv_statistic
+test: aggr_first_rewriter
 # NOTE: gporca_faults uses gp_fault_injector - so do not add to a parallel group
 test: gporca_faults
 

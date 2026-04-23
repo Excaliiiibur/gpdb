@@ -1,0 +1,1536 @@
+\pset format unaligned
+Output format is unaligned.
+\pset tuples_only on
+Tuples only is on.
+create schema aggr_first_rewriter;
+CREATE SCHEMA
+set search_path=aggr_first_rewriter;
+SET
+create table count_o(a int) distributed randomly;
+CREATE TABLE
+create table count_i(a int) distributed randomly;
+CREATE TABLE
+insert into count_o select generate_series(1,100);
+INSERT 0 100
+insert into count_i select generate_series(1,99);
+INSERT 0 99
+set optimizer=off;
+SET
+select 'pg_baseline_a=' || count(*)
+from count_o o
+where o.a + 1 > (select count(*) from count_i i where i.a = o.a);
+pg_baseline_a=100
+select 'pg_baseline_b=' || count(*)
+from count_o o
+where o.a + 1 > (select count(*) from count_i i where i.a = o.a);
+pg_baseline_b=100
+set optimizer=on;
+SET
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+show optimizer_enable_aggr_first_orca_enhancement;
+on
+select 'orca_enh_on=' || count(*)
+from count_o o
+where o.a + 1 > (select count(*) from count_i i where i.a = o.a);
+orca_enh_on=100
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+show optimizer_enable_aggr_first_orca_enhancement;
+off
+select 'orca_enh_off=' || count(*)
+from count_o o
+where o.a + 1 > (select count(*) from count_i i where i.a = o.a);
+orca_enh_off=100
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+select 'orca_enh_on_recheck=' || count(*)
+from count_o o
+where o.a + 1 > (select count(*) from count_i i where i.a = o.a);
+orca_enh_on_recheck=100
+create table orca_o(a int) distributed randomly;
+CREATE TABLE
+create table orca_i(a int, b int) distributed randomly;
+CREATE TABLE
+insert into orca_o values (1),(2),(3),(null);
+INSERT 0 4
+insert into orca_i values (1,10),(1,null),(null,7);
+INSERT 0 3
+set optimizer=on;
+SET
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where not (i.a is distinct from o.a));
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((count()), '0'::bigint))
+        ->  Result
+              ->  Hash Left Join
+                    Hash Cond: (NOT (orca_o.a IS DISTINCT FROM orca_i.a))
+                    ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                          Hash Key: orca_o.a
+                          ->  Seq Scan on orca_o
+                    ->  Hash
+                          ->  GroupAggregate
+                                Group Key: orca_i.a
+                                ->  Sort
+                                      Sort Key: orca_i.a
+                                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                            Hash Key: orca_i.a
+                                            ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_star_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where not (i.a is distinct from o.a))
+  order by a nulls last
+) t;
+orca_cnt_star_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where not (i.a is distinct from o.a));
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (SubPlan 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: (NOT (orca_i.a IS DISTINCT FROM orca_o.a))
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_star_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where not (i.a is distinct from o.a))
+  order by a nulls last
+) t;
+orca_cnt_star_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+select 'orca_cnt_expr_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(i.a) from orca_i i where not (i.a is distinct from o.a))
+  order by a nulls last
+) t;
+orca_cnt_expr_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+select 'orca_cnt_expr_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(i.a) from orca_i i where not (i.a is distinct from o.a))
+  order by a nulls last
+) t;
+orca_cnt_expr_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) is false);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((count()), '0'::bigint))
+        ->  Result
+              ->  Nested Loop Left Join
+                    Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                    ->  Seq Scan on orca_o
+                    ->  Materialize
+                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                ->  Result
+                                      ->  GroupAggregate
+                                            Group Key: orca_i.a
+                                            ->  Sort
+                                                  Sort Key: orca_i.a
+                                                  ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                        Hash Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_booltest_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) is false)
+  order by a nulls last
+) t;
+orca_cnt_booltest_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) is false);
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (SubPlan 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_booltest_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) is false)
+  order by a nulls last
+) t;
+orca_cnt_booltest_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) = false);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((count()), '0'::bigint))
+        ->  Result
+              ->  Hash Left Join
+                    Hash Cond: (NOT (orca_o.a IS DISTINCT FROM orca_i.a))
+                    ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                          Hash Key: orca_o.a
+                          ->  Seq Scan on orca_o
+                    ->  Hash
+                          ->  GroupAggregate
+                                Group Key: orca_i.a
+                                ->  Sort
+                                      Sort Key: orca_i.a
+                                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                            Hash Key: orca_i.a
+                                            ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_eqfalse_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) = false)
+  order by a nulls last
+) t;
+orca_cnt_eqfalse_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) = false);
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (SubPlan 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: (NOT (orca_i.a IS DISTINCT FROM orca_o.a))
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_eqfalse_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) = false)
+  order by a nulls last
+) t;
+orca_cnt_eqfalse_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) <> true);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((count()), '0'::bigint))
+        ->  Result
+              ->  Hash Left Join
+                    Hash Cond: (NOT (orca_o.a IS DISTINCT FROM orca_i.a))
+                    ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                          Hash Key: orca_o.a
+                          ->  Seq Scan on orca_o
+                    ->  Hash
+                          ->  GroupAggregate
+                                Group Key: orca_i.a
+                                ->  Sort
+                                      Sort Key: orca_i.a
+                                      ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                            Hash Key: orca_i.a
+                                            ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_neqtrue_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) <> true)
+  order by a nulls last
+) t;
+orca_cnt_neqtrue_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) <> true);
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (SubPlan 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: (NOT (orca_i.a IS DISTINCT FROM orca_o.a))
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_neqtrue_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where (i.a is distinct from o.a) <> true)
+  order by a nulls last
+) t;
+orca_cnt_neqtrue_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where not ((i.a is distinct from o.a) is true));
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((count()), '0'::bigint))
+        ->  Result
+              ->  Nested Loop Left Join
+                    Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS NOT TRUE)
+                    ->  Seq Scan on orca_o
+                    ->  Materialize
+                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                ->  Result
+                                      ->  GroupAggregate
+                                            Group Key: orca_i.a
+                                            ->  Sort
+                                                  Sort Key: orca_i.a
+                                                  ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                        Hash Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_notistrue_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where not ((i.a is distinct from o.a) is true))
+  order by a nulls last
+) t;
+orca_cnt_notistrue_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select count(*) from orca_i i where not ((i.a is distinct from o.a) is true));
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (SubPlan 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS NOT TRUE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_cnt_notistrue_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select count(*) from orca_i i where not ((i.a is distinct from o.a) is true))
+  order by a nulls last
+) t;
+orca_cnt_notistrue_off=1
+-- non null-propagate agg argument should be rejected by enhanced AGGR_FIRST path
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < coalesce((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false), 0);
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Seq Scan on orca_o
+        Filter: (a < COALESCE((SubPlan 1), '0'::bigint))
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false), 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < coalesce((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false), 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((sum(COALESCE(orca_i.b, 0))), '0'::bigint))
+        ->  GroupAggregate
+              Group Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+              ->  Sort
+                    Sort Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+                    ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                          Hash Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+                          ->  Nested Loop
+                                Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                                ->  Seq Scan on orca_o
+                                ->  Materialize
+                                      ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                            ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false), 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_o.a < (pg_catalog.sum((sum(COALESCE(orca_i.b, 0)))))) AND ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE))
+        ->  GroupAggregate
+              Group Key: orca_i.a
+              ->  Sort
+                    Sort Key: orca_i.a
+                    ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                          Hash Key: orca_i.a
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Seq Scan on orca_i
+        ->  Materialize
+              ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                    ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_nr_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)
+  order by a nulls last
+) t;
+orca_sum_coalesce_nr_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < (sum(COALESCE(orca_i.b, 0))))
+        ->  GroupAggregate
+              Group Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+              ->  Sort
+                    Sort Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+                    ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                          Hash Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+                          ->  Nested Loop
+                                Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                                ->  Seq Scan on orca_o
+                                ->  Materialize
+                                      ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                            ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_nr_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)
+  order by a nulls last
+) t;
+orca_sum_coalesce_nr_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where abs((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)) > 0;
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: (abs((pg_catalog.sum((sum(COALESCE(orca_i.b, 0)))))) > 0)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_abswrap_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where abs((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)) > 0
+  order by a nulls last
+) t;
+orca_sum_coalesce_abswrap_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where abs((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)) > 0;
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: (abs((sum(COALESCE(orca_i.b, 0)))) > 0)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_abswrap_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where abs((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false)) > 0
+  order by a nulls last
+) t;
+orca_sum_coalesce_abswrap_off=1,NULL
+-- boolean wrappers should preserve null-reject context for unsafe agg args
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true;
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: (((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) > 0) IS TRUE)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_istrue_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true
+  order by a nulls last
+) t;
+orca_sum_coalesce_istrue_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true;
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: (((sum(COALESCE(orca_i.b, 0))) > 0) IS TRUE)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_istrue_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true
+  order by a nulls last
+) t;
+orca_sum_coalesce_istrue_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: ((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) > 0)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_notle0_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_notle0_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0);
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: ((sum(COALESCE(orca_i.b, 0))) > 0)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_notle0_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_notle0_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where (((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) and true);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: ((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) > 0)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_andtrue_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) and true)
+  order by a nulls last
+) t;
+orca_sum_coalesce_andtrue_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where (((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) and true);
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: ((sum(COALESCE(orca_i.b, 0))) > 0)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_andtrue_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) and true)
+  order by a nulls last
+) t;
+orca_sum_coalesce_andtrue_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null;
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (NOT ((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) IS NULL))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Seq Scan on orca_o
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_isnotnull_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null
+  order by a nulls last
+) t;
+orca_sum_coalesce_isnotnull_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null;
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (NOT ((SubPlan 1) IS NULL))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_isnotnull_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null
+  order by a nulls last
+) t;
+orca_sum_coalesce_isnotnull_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) < 0);
+Gather Motion 3:1  (slice5; segments: 3)
+  ->  Result
+        Filter: (((pg_catalog.sum((sum(COALESCE(orca_i_1.b, 0))))) > 0) OR ((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) < 0))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Nested Loop Left Join
+                    Join Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                    ->  Seq Scan on orca_o
+                    ->  Materialize
+                          ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                ->  Result
+                                      ->  GroupAggregate
+                                            Group Key: orca_i_1.a
+                                            ->  Sort
+                                                  Sort Key: orca_i_1.a
+                                                  ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                        Hash Key: orca_i_1.a
+                                                        ->  Result
+                                                              ->  GroupAggregate
+                                                                    Group Key: orca_i_1.a
+                                                                    ->  Sort
+                                                                          Sort Key: orca_i_1.a
+                                                                          ->  Seq Scan on orca_i orca_i_1
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_orboth_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) < 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_orboth_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) < 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (((SubPlan 1) > 0) OR ((SubPlan 2) < 0))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+        SubPlan 2  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                  ->  Seq Scan on orca_i orca_i_1
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_orboth_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) < 0)
+  order by a nulls last
+) t;
+orca_sum_coalesce_orboth_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null);
+Gather Motion 3:1  (slice4; segments: 3)
+  ->  Result
+        Filter: (((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) > 0) OR ((SubPlan 1) IS NULL))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Seq Scan on orca_o
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+        SubPlan 1  (slice4; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                  ->  Seq Scan on orca_i orca_i_1
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_ormix_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+  order by a nulls last
+) t;
+orca_sum_coalesce_ormix_on=1,2,3,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (((SubPlan 1) > 0) OR ((SubPlan 2) IS NULL))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+        SubPlan 2  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                  ->  Seq Scan on orca_i orca_i_1
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_ormix_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0)
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+  order by a nulls last
+) t;
+orca_sum_coalesce_ormix_off=1,2,3,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < coalesce((select sum(i.b + 1) from orca_i i where not (i.a is distinct from o.a)), 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Hash Join
+        Hash Cond: (NOT (orca_i.a IS DISTINCT FROM orca_o.a))
+        Join Filter: (orca_o.a < COALESCE((pg_catalog.sum((sum((orca_i.b + 1))))), '0'::bigint))
+        ->  GroupAggregate
+              Group Key: orca_i.a
+              ->  Sort
+                    Sort Key: orca_i.a
+                    ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                          Hash Key: orca_i.a
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Seq Scan on orca_i
+        ->  Hash
+              ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                    Hash Key: orca_o.a
+                    ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_expr_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(i.b + 1) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_sum_expr_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where o.a < coalesce((select sum(i.b + 1) from orca_i i where not (i.a is distinct from o.a)), 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (orca_o.a < COALESCE((sum((orca_i.b + 1))), '0'::bigint))
+        ->  GroupAggregate
+              Group Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+              ->  Sort
+                    Sort Key: orca_o.a, orca_o.ctid, orca_o.gp_segment_id
+                    ->  Hash Join
+                          Hash Cond: (NOT (orca_o.a IS DISTINCT FROM orca_i.a))
+                          ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                Hash Key: orca_o.a
+                                ->  Seq Scan on orca_o
+                          ->  Hash
+                                ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_expr_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(i.b + 1) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_sum_expr_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+select 'orca_sum_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_sum_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+select 'orca_sum_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select sum(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_sum_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+select 'orca_min_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select min(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_min_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+select 'orca_min_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select min(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_min_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+select 'orca_max_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select max(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_max_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+select 'orca_max_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where o.a < coalesce((select max(i.b) from orca_i i where not (i.a is distinct from o.a)), 0)
+  order by a nulls last
+) t;
+orca_max_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where not ((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: ((pg_catalog.avg((avg(COALESCE(orca_i.b, 0))))) > '0'::numeric)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_notle0_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not ((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0)
+  order by a nulls last
+) t;
+orca_avg_coalesce_notle0_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where not ((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0);
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: ((avg(COALESCE(orca_i.b, 0))) > '0'::numeric)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_notle0_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not ((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0)
+  order by a nulls last
+) t;
+orca_avg_coalesce_notle0_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where (select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null;
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (NOT ((min((min(COALESCE(orca_i.b, 0))))) IS NULL))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Seq Scan on orca_o
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_min_coalesce_isnotnull_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null
+  order by a nulls last
+) t;
+orca_min_coalesce_isnotnull_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where (select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null;
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (NOT ((SubPlan 1) IS NULL))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_min_coalesce_isnotnull_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is not null
+  order by a nulls last
+) t;
+orca_min_coalesce_isnotnull_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select max(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true;
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Broadcast Motion 3:3  (slice2; segments: 3)
+              ->  Result
+                    Filter: (((max((max(COALESCE(orca_i.b, 0))))) > 0) IS TRUE)
+                    ->  GroupAggregate
+                          Group Key: orca_i.a
+                          ->  Sort
+                                Sort Key: orca_i.a
+                                ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                      Hash Key: orca_i.a
+                                      ->  Result
+                                            ->  GroupAggregate
+                                                  Group Key: orca_i.a
+                                                  ->  Sort
+                                                        Sort Key: orca_i.a
+                                                        ->  Seq Scan on orca_i
+        ->  Seq Scan on orca_o
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_max_coalesce_istrue_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select max(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true
+  order by a nulls last
+) t;
+orca_max_coalesce_istrue_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where ((select max(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true;
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: (((max(COALESCE(orca_i.b, 0))) > 0) IS TRUE)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_max_coalesce_istrue_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where ((select max(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true
+  order by a nulls last
+) t;
+orca_max_coalesce_istrue_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where (not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0))
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) >= 1);
+Gather Motion 3:1  (slice5; segments: 3)
+  ->  Result
+        Filter: (((pg_catalog.sum((sum(COALESCE(orca_i_1.b, 0))))) > 0) OR ((pg_catalog.sum((sum(COALESCE(orca_i.b, 0))))) >= 1))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Nested Loop Left Join
+                    Join Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                    ->  Seq Scan on orca_o
+                    ->  Materialize
+                          ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                ->  Result
+                                      ->  GroupAggregate
+                                            Group Key: orca_i_1.a
+                                            ->  Sort
+                                                  Sort Key: orca_i_1.a
+                                                  ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                        Hash Key: orca_i_1.a
+                                                        ->  Result
+                                                              ->  GroupAggregate
+                                                                    Group Key: orca_i_1.a
+                                                                    ->  Sort
+                                                                          Sort Key: orca_i_1.a
+                                                                          ->  Seq Scan on orca_i orca_i_1
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_or_notle0_ge1_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0))
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) >= 1)
+  order by a nulls last
+) t;
+orca_sum_coalesce_or_notle0_ge1_on=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where (not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0))
+   or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) >= 1);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (((SubPlan 1) > 0) OR ((SubPlan 2) >= 1))
+        ->  Seq Scan on orca_o
+        SubPlan 1  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+        SubPlan 2  (slice3; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i_1.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                  ->  Seq Scan on orca_i orca_i_1
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_sum_coalesce_or_notle0_ge1_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (not ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0))
+     or ((select sum(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) >= 1)
+  order by a nulls last
+) t;
+orca_sum_coalesce_or_notle0_ge1_off=1,NULL
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true)
+  and (o.a is not null);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Seq Scan on orca_o
+              Filter: (NOT (a IS NULL))
+        ->  Materialize
+              ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                    ->  Result
+                          Filter: (((pg_catalog.avg((avg(COALESCE(orca_i.b, 0))))) > '0'::numeric) IS TRUE)
+                          ->  GroupAggregate
+                                Group Key: orca_i.a
+                                ->  Sort
+                                      Sort Key: orca_i.a
+                                      ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                            Hash Key: orca_i.a
+                                            ->  Result
+                                                  ->  GroupAggregate
+                                                        Group Key: orca_i.a
+                                                        ->  Sort
+                                                              Sort Key: orca_i.a
+                                                              ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_istrue_and_notnull_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true)
+    and (o.a is not null)
+  order by a nulls last
+) t;
+orca_avg_coalesce_istrue_and_notnull_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true)
+  and (o.a is not null);
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+              Filter: (NOT (a IS NULL))
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: (((avg(COALESCE(orca_i.b, 0))) > '0'::numeric) IS TRUE)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_istrue_and_notnull_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) > 0) is true)
+    and (o.a is not null)
+  order by a nulls last
+) t;
+orca_avg_coalesce_istrue_and_notnull_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where not (
+  (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0) is not false)
+  or (o.a is null)
+);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Nested Loop
+        Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+        ->  Seq Scan on orca_o
+              Filter: (NOT (a IS NULL))
+        ->  Materialize
+              ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                    ->  Result
+                          Filter: (((pg_catalog.avg((avg(COALESCE(orca_i.b, 0))))) <= '0'::numeric) IS FALSE)
+                          ->  GroupAggregate
+                                Group Key: orca_i.a
+                                ->  Sort
+                                      Sort Key: orca_i.a
+                                      ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                            Hash Key: orca_i.a
+                                            ->  Result
+                                                  ->  GroupAggregate
+                                                        Group Key: orca_i.a
+                                                        ->  Sort
+                                                              Sort Key: orca_i.a
+                                                              ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_not_isnotfalse_or_isnull_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not (
+    (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0) is not false)
+    or (o.a is null)
+  )
+  order by a nulls last
+) t;
+orca_avg_coalesce_not_isnotfalse_or_isnull_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where not (
+  (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0) is not false)
+  or (o.a is null)
+);
+Result
+  Filter: (SubPlan 1)
+  ->  Gather Motion 3:1  (slice1; segments: 3)
+        ->  Seq Scan on orca_o
+              Filter: (NOT (a IS NULL))
+  SubPlan 1  (slice0)
+    ->  Result
+          ->  Result
+                Filter: (((avg(COALESCE(orca_i.b, 0))) <= '0'::numeric) IS FALSE)
+                ->  Aggregate
+                      ->  Result
+                            Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                            ->  Materialize
+                                  ->  Gather Motion 3:1  (slice2; segments: 3)
+                                        ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_avg_coalesce_not_isnotfalse_or_isnull_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not (
+    (((select avg(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) <= 0) is not false)
+    or (o.a is null)
+  )
+  order by a nulls last
+) t;
+orca_avg_coalesce_not_isnotfalse_or_isnull_off=1
+set optimizer_enable_aggr_first_orca_enhancement=on;
+SET
+explain (costs off)
+select * from orca_o o
+where not (
+  ((select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+   or (o.a is null)
+);
+Gather Motion 3:1  (slice3; segments: 3)
+  ->  Result
+        Filter: (NOT ((min((min(COALESCE(orca_i.b, 0))))) IS NULL))
+        ->  Nested Loop Left Join
+              Join Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+              ->  Seq Scan on orca_o
+                    Filter: (NOT (a IS NULL))
+              ->  Materialize
+                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                          ->  Result
+                                ->  GroupAggregate
+                                      Group Key: orca_i.a
+                                      ->  Sort
+                                            Sort Key: orca_i.a
+                                            ->  Redistribute Motion 3:3  (slice1; segments: 3)
+                                                  Hash Key: orca_i.a
+                                                  ->  Result
+                                                        ->  GroupAggregate
+                                                              Group Key: orca_i.a
+                                                              ->  Sort
+                                                                    Sort Key: orca_i.a
+                                                                    ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_min_coalesce_not_or_isnull_on=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not (
+    ((select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+     or (o.a is null)
+  )
+  order by a nulls last
+) t;
+orca_min_coalesce_not_or_isnull_on=1
+set optimizer_enable_aggr_first_orca_enhancement=off;
+SET
+explain (costs off)
+select * from orca_o o
+where not (
+  ((select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+   or (o.a is null)
+);
+Gather Motion 3:1  (slice2; segments: 3)
+  ->  Result
+        Filter: (NOT ((SubPlan 1) IS NULL))
+        ->  Seq Scan on orca_o
+              Filter: (NOT (a IS NULL))
+        SubPlan 1  (slice2; segments: 3)
+          ->  Aggregate
+                ->  Result
+                      Filter: ((orca_i.a IS DISTINCT FROM orca_o.a) IS FALSE)
+                      ->  Materialize
+                            ->  Broadcast Motion 3:3  (slice1; segments: 3)
+                                  ->  Seq Scan on orca_i
+Optimizer: Pivotal Optimizer (GPORCA)
+select 'orca_min_coalesce_not_or_isnull_off=' || coalesce(string_agg(coalesce(a::text,'NULL'), ',' order by a nulls last), '')
+from (
+  select a from orca_o o
+  where not (
+    ((select min(coalesce(i.b, 0)) from orca_i i where (i.a is distinct from o.a) is false) is null)
+     or (o.a is null)
+  )
+  order by a nulls last
+) t;
+orca_min_coalesce_not_or_isnull_off=1
+create table agg_o(a int) distributed randomly;
+CREATE TABLE
+create table agg_i(a int, b int) distributed randomly;
+CREATE TABLE
+insert into agg_o values (1),(2),(3),(4),(5);
+INSERT 0 5
+insert into agg_i values (1,10),(1,null),(2,20),(4,null);
+INSERT 0 4
+set optimizer=off;
+SET
+select 'sum_off=' || count(*)
+from agg_o o
+where o.a < coalesce((select sum(i.b) from agg_i i where i.a = o.a), 0);
+sum_off=2
+select 'avg_off=' || count(*)
+from agg_o o
+where o.a < coalesce((select avg(i.b) from agg_i i where i.a = o.a), 0);
+avg_off=2
+set optimizer=on;
+SET
+select 'sum_on=' || count(*)
+from agg_o o
+where o.a < coalesce((select sum(i.b) from agg_i i where i.a = o.a), 0);
+sum_on=2
+select 'avg_on=' || count(*)
+from agg_o o
+where o.a < coalesce((select avg(i.b) from agg_i i where i.a = o.a), 0);
+avg_on=2
+drop schema aggr_first_rewriter cascade;
+DROP SCHEMA
